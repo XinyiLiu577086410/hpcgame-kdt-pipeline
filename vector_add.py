@@ -21,11 +21,12 @@ def vector_add_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.Tile]
     kdt.load(io_tensors['b'][0 *  BLOCK_SIZE: (0 + 1) * BLOCK_SIZE], b_tile)
     for i in range(num_blocks // 2):
         j = i * 2
+        # 执行向量加法
+        kdt.add(a_tile, b_tile, b_tile)
         # 加载输入数据到 SPM
         kdt.load(io_tensors['a'][(j + 1) * BLOCK_SIZE: (j + 2) * BLOCK_SIZE], c_tile)
         kdt.load(io_tensors['b'][(j + 1) * BLOCK_SIZE: (j + 2) * BLOCK_SIZE], d_tile)
         # 执行向量加法
-        kdt.add(a_tile, b_tile, b_tile)
         kdt.add(c_tile, d_tile, d_tile)
         # 存储结果回显存
         kdt.store(b_tile, io_tensors['c'][j * BLOCK_SIZE: (j + 1) * BLOCK_SIZE])
