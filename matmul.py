@@ -31,9 +31,12 @@ def matmul_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.Tile]):
 
     for k_id in range(num_k_blocks):
         K_base = k_id * BLOCK_K_SIZE
-        kdt.load(io_tensors["A"][M_base:M_base+BLOCK_SIZE,K_base:K_base+BLOCK_K_SIZE], a_tile)
-        kdt.load(io_tensors["B"][K_base:K_base+BLOCK_K_SIZE,N_base:N_base+BLOCK_SIZE], b_tile)
-        kdt.matmul(a_tile, b_tile, c_tile, accumulate=True)
+        kdt.load(io_tensors["A"][M_base:M_base+BLOCK_SIZE,K_base:K_base+BLOCK_K_SIZE//2], a_tile[:,0:BLOCK_K_SIZE//2])
+        kdt.load(io_tensors["B"][K_base:K_base+BLOCK_K_SIZE//2,N_base:N_base+BLOCK_SIZE], b_tile[0:BLOCK_K_SIZE//2,:])
+        kdt.matmul(a_tile[:,0:BLOCK_K_SIZE//2], b_tile[0:BLOCK_K_SIZE//2,:], c_tile, accumulate=True)
+        kdt.load(io_tensors["A"][M_base:M_base+BLOCK_SIZE,K_base+BLOCK_K_SIZE//2:K_base+BLOCK_K_SIZE], a_tile[:,BLOCK_K_SIZE//2:BLOCK_K_SIZE])
+        kdt.load(io_tensors["B"][K_base+BLOCK_K_SIZE//2:K_base+BLOCK_K_SIZE,N_base:N_base+BLOCK_SIZE], b_tile[BLOCK_K_SIZE//2:BLOCK_K_SIZE,:])
+        kdt.matmul(a_tile[:,BLOCK_K_SIZE//2:BLOCK_K_SIZE], b_tile[BLOCK_K_SIZE//2:BLOCK_K_SIZE,:], c_tile, accumulate=True)
     kdt.store(c_tile, io_tensors["C"][M_base:M_base+BLOCK_SIZE,N_base:N_base+BLOCK_SIZE])
 
 def get_kernel(task_id: int) -> kdt.KernelFunction:
