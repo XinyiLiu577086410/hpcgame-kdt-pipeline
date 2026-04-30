@@ -5,89 +5,81 @@ import kdt
 import torch
 
 def calculate_num_jobs(task_args: dict[str, int]) -> int:
-    NUM_SM = 32
-    BLOCK_SIZE_M = 256
+    BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
-    return max(NUM_SM, (task_args["M"] // BLOCK_SIZE_M) * (task_args["N"] // BLOCK_SIZE_N))
+    return (task_args["M"] // BLOCK_SIZE_M) * (task_args["N"] // BLOCK_SIZE_N)
 
 @kdt.kernel(num_jobs_calculator=calculate_num_jobs)
 def matmul_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.Tile]):
+    BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 256
-    NuM_SM = 32
+    BLOCK_SIZE_K = 64
     N = task_args['N']
     M = task_args['M']
     K = task_args['K']
-    num_n_blocks = N // BLOCK_SIZE_N
-    BLOCK_SIZE_M = 128 if ((M // 256) * num_n_blocks) < 32 else 256
-
-    num_m_blocks = M // BLOCK_SIZE_M  
-    num_k_blocks = K // BLOCK_SIZE_K
+    num_m_blocks = M // BLOCK_SIZE_M  # 计算需要处理的块数
+    num_n_blocks = N // BLOCK_SIZE_N  # 计算需要处理的块数
+    num_k_blocks = K // BLOCK_SIZE_K  # 计算需要处理的块数
     # 分配 SPM 上的数据块
     job_id = kdt.get_job_id()
     job_id_m = job_id % num_m_blocks
     job_id_n = job_id // num_m_blocks
-    M_base = job_id_m * BLOCK_SIZE_M
-    N_base = job_id_n * BLOCK_SIZE_N
+    M_start = job_id_m * BLOCK_SIZE_M
+    M_end = M_start + BLOCK_SIZE_M
+    N_start = job_id_n * BLOCK_SIZE_N
+    N_end = N_start + BLOCK_SIZE_N
 
-    a_tile = kdt.alloc_spm((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype='float32')
-    b_tile = kdt.alloc_spm((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype='float32')
+    NUM_STAGES = 3
+    Ab_tile = kdt.alloc_spm((NUM_STAGES, BLOCK_SIZE_M, BLOCK_SIZE_K), dtype='float32')
+    Bb_tile = kdt.alloc_spm((NUM_STAGES, BLOCK_SIZE_K, BLOCK_SIZE_N), dtype='float32')
+    As_tile = kdt.alloc_spm((NUM_STAGES, BLOCK_SIZE_M, 1), dtype='float32')
+    Bs_tile = kdt.alloc_spm((NUM_STAGES, 1, BLOCK_SIZE_N), dtype='float32')
+    scale_temp = kdt.alloc_spm((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype='float32', init_value = 0.0)
+    c_tile_temp = kdt.alloc_spm((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype='float32', init_value = 0.0)
     c_tile = kdt.alloc_spm((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype='float32', init_value = 0.0)
-    as_tile = kdt.alloc_spm((BLOCK_SIZE_M, BLOCK_SIZE_K // 64), dtype='float32')
-    bs_tile = kdt.alloc_spm((BLOCK_SIZE_K // 64, BLOCK_SIZE_N), dtype='float32')
 
-    kdt.load(io_tensors["Ab"][M_base:M_base+BLOCK_SIZE_M,0:0+BLOCK_SIZE_K//2], a_tile[:,0:BLOCK_SIZE_K//2])
-    kdt.load(io_tensors["As"][M_base:M_base+BLOCK_SIZE_M,0//64:(0+BLOCK_SIZE_K//2)//64], as_tile[:,0:BLOCK_SIZE_K//2//64])
-    kdt.load(io_tensors["Bb"][0:0+BLOCK_SIZE_K//2,N_base:N_base+BLOCK_SIZE_N], b_tile[0:BLOCK_SIZE_K//2,:])
-    kdt.load(io_tensors["Bs"][0//64:(0+BLOCK_SIZE_K//2)//64,N_base:N_base+BLOCK_SIZE_N], bs_tile[0:BLOCK_SIZE_K//2//64,:])
-    for k_id in range(num_k_blocks):
-        K_base = k_id * BLOCK_SIZE_K
-        kdt.mul(a_tile[:, 0:64], kdt.broadcast_to(as_tile[:, 0:1], 1, 64), a_tile[:, 0:64])
-        kdt.mul(a_tile[:, 64:128], kdt.broadcast_to(as_tile[:, 1:2], 1, 64), a_tile[:, 64:128])
-        kdt.mul(b_tile[0:64, :], kdt.broadcast_to(bs_tile[0:1, :], 0, 64), b_tile[0:64, :])
-        kdt.mul(b_tile[64:128, :], kdt.broadcast_to(bs_tile[1:2, :], 0, 64), b_tile[64:128, :])
-        kdt.load(io_tensors["Ab"][M_base:M_base+BLOCK_SIZE_M,K_base+BLOCK_SIZE_K//2:K_base+BLOCK_SIZE_K], a_tile[:,BLOCK_SIZE_K//2:BLOCK_SIZE_K])
-        kdt.load(io_tensors["As"][M_base:M_base+BLOCK_SIZE_M,(K_base+BLOCK_SIZE_K//2)//64:(K_base+BLOCK_SIZE_K)//64], as_tile[:,BLOCK_SIZE_K//2//64:BLOCK_SIZE_K//64])
-        kdt.load(io_tensors["Bb"][K_base+BLOCK_SIZE_K//2:K_base+BLOCK_SIZE_K,N_base:N_base+BLOCK_SIZE_N], b_tile[BLOCK_SIZE_K//2:BLOCK_SIZE_K,:])
-        kdt.load(io_tensors["Bs"][(K_base+BLOCK_SIZE_K//2)//64:(K_base+BLOCK_SIZE_K)//64,N_base:N_base+BLOCK_SIZE_N], bs_tile[BLOCK_SIZE_K//2//64:BLOCK_SIZE_K//64,:])
-        kdt.matmul(a_tile[:,0:BLOCK_SIZE_K//2], b_tile[0:BLOCK_SIZE_K//2,:], c_tile, accumulate=True)
-        kdt.mul(a_tile[:, 128:192], kdt.broadcast_to(as_tile[:, 2:3], 1, 64), a_tile[:, 128:192])
-        if k_id + 1 < num_k_blocks:
-            K_base_nxt = K_base + BLOCK_SIZE_K
-            kdt.load(io_tensors["Ab"][M_base:M_base+BLOCK_SIZE_M,K_base_nxt:K_base_nxt+BLOCK_SIZE_K//2], a_tile[:,0:BLOCK_SIZE_K//2])
-            kdt.load(io_tensors["As"][M_base:M_base+BLOCK_SIZE_M,K_base_nxt//64:(K_base_nxt+BLOCK_SIZE_K//2)//64], as_tile[:,0:BLOCK_SIZE_K//2//64])
-            kdt.load(io_tensors["Bb"][K_base_nxt:K_base_nxt+BLOCK_SIZE_K//2,N_base:N_base+BLOCK_SIZE_N], b_tile[0:BLOCK_SIZE_K//2,:])
-            kdt.load(io_tensors["Bs"][K_base_nxt//64:(K_base_nxt+BLOCK_SIZE_K//2)//64,N_base:N_base+BLOCK_SIZE_N], bs_tile[0:BLOCK_SIZE_K//2//64,:])
-        kdt.mul(a_tile[:, 192:256], kdt.broadcast_to(as_tile[:, 3:4], 1, 64), a_tile[:, 192:256])
-        kdt.mul(b_tile[128:192, :], kdt.broadcast_to(bs_tile[2:3, :], 0, 64), b_tile[128:192, :])
-        kdt.mul(b_tile[192:256, :], kdt.broadcast_to(bs_tile[3:4, :], 0, 64), b_tile[192:256, :])
-        kdt.matmul(a_tile[:,BLOCK_SIZE_K//2:BLOCK_SIZE_K], b_tile[BLOCK_SIZE_K//2:BLOCK_SIZE_K,:], c_tile, accumulate=True)
-    kdt.store(c_tile, io_tensors["C"][M_base:M_base+BLOCK_SIZE_M,N_base:N_base+BLOCK_SIZE_N])
+    for stage in range(0, NUM_STAGES - 1):
+        k = stage
+        K_start = k * BLOCK_SIZE_K
+        K_end = K_start + BLOCK_SIZE_K
+        kdt.load(io_tensors['Ab'][M_start:M_end, K_start:K_end], Ab_tile[stage, :, :])
+        kdt.load(io_tensors['Bb'][K_start:K_end, N_start:N_end], Bb_tile[stage, :, :])
+        kdt.load(io_tensors['As'][M_start:M_end, k:k+1], As_tile[stage, :, :])
+        kdt.load(io_tensors['Bs'][k:k+1, N_start:N_end], Bs_tile[stage, :, :])
+
+    for k in range(num_k_blocks):
+        stage = k % NUM_STAGES
+        K_start = k * BLOCK_SIZE_K
+        K_end = K_start + BLOCK_SIZE_K
+
+        # kdt.load(io_tensors['Ab'][M_start:M_end, K_start:K_end], Ab_tile[stage, :, :])
+        # kdt.load(io_tensors['Bb'][K_start:K_end, N_start:N_end], Bb_tile[stage, :, :])
+        # kdt.load(io_tensors['As'][M_start:M_end, k:k+1], As_tile[stage, :, :])
+        # kdt.load(io_tensors['Bs'][k:k+1, N_start:N_end], Bs_tile[stage, :, :])
+    
+        kdt.matmul(Ab_tile[stage], Bb_tile[stage], c_tile_temp, accumulate = False)
+        kdt.mul(
+            kdt.broadcast_to(As_tile[stage], 1, BLOCK_SIZE_N),
+            kdt.broadcast_to(Bs_tile[stage], 0, BLOCK_SIZE_M), 
+            scale_temp
+        )
+        next_k = k + NUM_STAGES -1
+        next_stage = next_k % NUM_STAGES
+        if next_k < num_k_blocks: 
+            next_K_start = next_k * BLOCK_SIZE_K
+            next_K_end = next_K_start + BLOCK_SIZE_K
+            kdt.load(io_tensors['Ab'][M_start:M_end, next_K_start:next_K_end], Ab_tile[next_stage, :, :])
+            kdt.load(io_tensors['Bb'][next_K_start:next_K_end, N_start:N_end], Bb_tile[next_stage, :, :])
+            kdt.load(io_tensors['As'][M_start:M_end, next_k:next_k+1], As_tile[next_stage, :, :])
+            kdt.load(io_tensors['Bs'][next_k:next_k+1, N_start:N_end], Bs_tile[next_stage, :, :])
+        kdt.fma(
+            scale_temp,
+            c_tile_temp,
+            c_tile,
+            c_tile)
+    kdt.store(c_tile, io_tensors["C"][M_start:M_end,N_start:N_end])
 
 def get_kernel(task_id: int) -> kdt.KernelFunction:
     if task_id == 3:
         return matmul_kernel
     return None
-
-def main():
-    M, N, K = 512, 1024, 2560
-    a = torch.randn((M, K), dtype=torch.float32).clamp(-1, 1)
-    b = torch.randn((K, N), dtype=torch.float32).clamp(-1, 1)
-    c = torch.zeros((M, N), dtype=torch.float32)
-
-    task_args = {'M': M, 'N': N, 'K': K}
-    io_tensors = {'A': a, 'B': b, 'C': c}
-
-    compiled_kernel = matmul_kernel.compile(task_args, io_tensors)
-
-    tpu_spec = kdt.TPUSpec(num_sms=32, load_store_latency=1000, spm_size=384*1024)
-    num_cycles = kdt.launch_kernel(compiled_kernel, io_tensors, tpu_spec)
-
-    c_ref = a @ b
-    print("Result C:", c)
-    print(torch.isclose(c, c_ref, atol=1e-5, rtol=2e-3))
-    assert torch.allclose(c, c_ref, atol=1e-5, rtol=2e-3), "Result incorrect!"
-    print(f"Kernel executed in {num_cycles} cycles.")
-    
-if __name__ == '__main__':
-    main()
