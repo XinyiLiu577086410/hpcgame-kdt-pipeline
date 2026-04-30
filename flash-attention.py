@@ -44,7 +44,6 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
     global_exp_rowsum_new = kdt.alloc_spm((BLOCK_SIZE_QO,), dtype='float32')
 
     tmp1 = kdt.alloc_spm((BLOCK_SIZE_QO,), dtype='float32')
-    # tmp2 = kdt.alloc_spm((BLOCK_SIZE_QO,), dtype='float32')
 
     Q_global = io_tensors['Q']
     K_global = io_tensors['K']
@@ -54,27 +53,27 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
     kdt.load(Q_global[Q_start:Q_end, :], Q_tile)
 
     for kv_id in range(0, NUM_STAGES):
-        stage = kv_id % NUM_STAGES
-        KV_start = kv_id * BLOCK_SIZE_KV
-        KV_end = KV_start + BLOCK_SIZE_KV
-        kdt.load(K_global[KV_start:KV_end, :], K_tile[stage, :, :])
-        kdt.load(V_global[KV_start:KV_end, :], V_tile[stage, :, :])
+        if kv_id < num_kv_blocks:
+            stage = kv_id % NUM_STAGES
+            KV_start = kv_id * BLOCK_SIZE_KV
+            KV_end = KV_start + BLOCK_SIZE_KV
+            kdt.load(K_global[KV_start:KV_end, :], K_tiles[stage, :, :])
+            kdt.load(V_global[KV_start:KV_end, :], V_tiles[stage, :, :])
 
     for kv_id in range(0, num_kv_blocks):
-        # KV_start = kv_id * BLOCK_SIZE_KV
-        # KV_end = KV_start + BLOCK_SIZE_KV
-        # kdt.load(K_global[KV_start:KV_end, :], K_tile)
-        # kdt.load(V_global[KV_start:KV_end, :], V_tile)
-        
+        stage = kv_id % NUM_STAGES
+        K_tile = K_tiles[stage]
+        V_tile = V_tiles[stage]
+
         kdt.matmul(Q_tile, kdt.transpose(K_tile, 0, 1), QK_tile, accumulate=False)
         
         prefetch_kv_id = kv_id + (NUM_STAGES - 1)
         prefetch_stage = prefetch_kv_id % NUM_STAGES
-        if k != 0 and prefetch_kv_id < num_kv_blocks:
+        if kv_id != 0 and prefetch_kv_id < num_kv_blocks:
             KV_start = prefetch_kv_id * BLOCK_SIZE_KV
             KV_end = KV_start + BLOCK_SIZE_KV
-            kdt.load(K_global[KV_start:KV_end, :], K_tile[prefetch_stage, :, :])
-            kdt.load(V_global[KV_start:KV_end, :], V_tile[prefetch_stage, :, :])
+            kdt.load(K_global[KV_start:KV_end, :], K_tiles[prefetch_stage])
+            kdt.load(V_global[KV_start:KV_end, :], V_tiles[prefetch_stage])
         
         kdt.reduce(QK_tile, 1, 'max', local_rowmax)
         
@@ -93,8 +92,6 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
         global_rowmax_diff_exp = global_rowmax_diff
         local_rowmax_diff_exp = local_rowmax_diff
         kdt.mul(global_rowmax_diff_exp, global_exp_rowsum, tmp1)
-        # kdt.mul(local_rowmax_diff_exp, local_exp_rowsum, tmp2)
-        # kdt.add(tmp1, tmp2, global_exp_rowsum_new)
         kdt.fma(local_rowmax_diff_exp, local_exp_rowsum, tmp1, global_exp_rowsum_new)
         kdt.mul(O_tile, kdt.broadcast_to(kdt.unsqueeze(tmp1, 1), 1, D), O_tile)
         kdt.matmul(QK_tile_sub_exp, V_tile, V_tile)
