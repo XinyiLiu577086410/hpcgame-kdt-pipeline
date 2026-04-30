@@ -41,7 +41,7 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
     global_exp_rowsum_new = kdt.alloc_spm((BLOCK_SIZE_QO,), dtype='float32')
 
     tmp1 = kdt.alloc_spm((BLOCK_SIZE_QO,), dtype='float32')
-    tmp2 = kdt.alloc_spm((BLOCK_SIZE_QO,), dtype='float32')
+    # tmp2 = kdt.alloc_spm((BLOCK_SIZE_QO,), dtype='float32')
 
     Q_global = io_tensors['Q']
     K_global = io_tensors['K']
@@ -75,8 +75,9 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
         global_rowmax_diff_exp = global_rowmax_diff
         local_rowmax_diff_exp = local_rowmax_diff
         kdt.mul(global_rowmax_diff_exp, global_exp_rowsum, tmp1)
-        kdt.mul(local_rowmax_diff_exp, local_exp_rowsum, tmp2)
-        kdt.add(tmp1, tmp2, global_exp_rowsum_new)
+        # kdt.mul(local_rowmax_diff_exp, local_exp_rowsum, tmp2)
+        # kdt.add(tmp1, tmp2, global_exp_rowsum_new)
+        kdt.fma(local_rowmax_diff_exp, local_exp_rowsum, tmp1, global_exp_rowsum_new)
         kdt.mul(O_tile, kdt.broadcast_to(kdt.unsqueeze(tmp1, 1), 1, D), O_tile)
         kdt.matmul(QK_tile_sub_exp, V_tile, V_tile)
         PV_tile = V_tile
