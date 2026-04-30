@@ -12,6 +12,9 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
     inf = -3.4e38
     BLOCK_SIZE_QO = 128
     BLOCK_SIZE_KV = 128
+    
+    NUM_STAGES = 2
+
     S_qo = task_args['S_qo']
     S_kv = task_args['S_kv']
     D = task_args['D']
@@ -23,9 +26,9 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
     Q_end = Q_start + BLOCK_SIZE_QO
 
     Q_tile = kdt.alloc_spm((BLOCK_SIZE_QO, D), dtype='float32')
-    K_tile = kdt.alloc_spm((BLOCK_SIZE_KV, D), dtype='float32')
+    K_tiles = kdt.alloc_spm((NUM_STAGES, BLOCK_SIZE_KV, D), dtype='float32')
+    V_tiles = kdt.alloc_spm((NUM_STAGES, BLOCK_SIZE_KV, D), dtype='float32')
     QK_tile = kdt.alloc_spm((BLOCK_SIZE_QO, BLOCK_SIZE_KV), dtype='float32')
-    V_tile = kdt.alloc_spm((BLOCK_SIZE_KV, D), dtype='float32')
     O_tile = kdt.alloc_spm((BLOCK_SIZE_QO, D), dtype='float32', init_value = 0)
     
     global_rowmax = kdt.alloc_spm((BLOCK_SIZE_QO,), dtype='float32', init_value=inf)
@@ -50,13 +53,28 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
     
     kdt.load(Q_global[Q_start:Q_end, :], Q_tile)
 
-    for kv_id in range(0, num_kv_blocks):
+    for kv_id in range(0, NUM_STAGES):
+        stage = kv_id % NUM_STAGES
         KV_start = kv_id * BLOCK_SIZE_KV
         KV_end = KV_start + BLOCK_SIZE_KV
-        kdt.load(K_global[KV_start:KV_end, :], K_tile)
-        kdt.load(V_global[KV_start:KV_end, :], V_tile)
+        kdt.load(K_global[KV_start:KV_end, :], K_tile[stage, :, :])
+        kdt.load(V_global[KV_start:KV_end, :], V_tile[stage, :, :])
+
+    for kv_id in range(0, num_kv_blocks):
+        # KV_start = kv_id * BLOCK_SIZE_KV
+        # KV_end = KV_start + BLOCK_SIZE_KV
+        # kdt.load(K_global[KV_start:KV_end, :], K_tile)
+        # kdt.load(V_global[KV_start:KV_end, :], V_tile)
         
         kdt.matmul(Q_tile, kdt.transpose(K_tile, 0, 1), QK_tile, accumulate=False)
+        
+        prefetch_kv_id = kv_id + (NUM_STAGES - 1)
+        prefetch_stage = prefetch_kv_id % NUM_STAGES
+        if k != 0 and prefetch_kv_id < num_kv_blocks:
+            KV_start = prefetch_kv_id * BLOCK_SIZE_KV
+            KV_end = KV_start + BLOCK_SIZE_KV
+            kdt.load(K_global[KV_start:KV_end, :], K_tile[prefetch_stage, :, :])
+            kdt.load(V_global[KV_start:KV_end, :], V_tile[prefetch_stage, :, :])
         
         kdt.reduce(QK_tile, 1, 'max', local_rowmax)
         
