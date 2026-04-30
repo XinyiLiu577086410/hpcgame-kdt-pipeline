@@ -40,12 +40,13 @@ def matmul_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.Tile]):
 
     for stage in range(0, NUM_STAGES - 1):
         k = stage
-        K_start = k * BLOCK_SIZE_K
-        K_end = K_start + BLOCK_SIZE_K
-        kdt.load(io_tensors['Ab'][M_start:M_end, K_start:K_end], Ab_tile[stage, :, :])
-        kdt.load(io_tensors['Bb'][K_start:K_end, N_start:N_end], Bb_tile[stage, :, :])
-        kdt.load(io_tensors['As'][M_start:M_end, k:k+1], As_tile[stage, :, :])
-        kdt.load(io_tensors['Bs'][k:k+1, N_start:N_end], Bs_tile[stage, :, :])
+        if k < num_k_blocks:
+            K_start = k * BLOCK_SIZE_K
+            K_end = K_start + BLOCK_SIZE_K
+            kdt.load(io_tensors['Ab'][M_start:M_end, K_start:K_end], Ab_tile[stage, :, :])
+            kdt.load(io_tensors['Bb'][K_start:K_end, N_start:N_end], Bb_tile[stage, :, :])
+            kdt.load(io_tensors['As'][M_start:M_end, k:k+1], As_tile[stage, :, :])
+            kdt.load(io_tensors['Bs'][k:k+1, N_start:N_end], Bs_tile[stage, :, :])
 
     for k in range(num_k_blocks):
         stage = k % NUM_STAGES
