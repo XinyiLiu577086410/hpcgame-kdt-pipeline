@@ -59,13 +59,13 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
             KV_end = KV_start + BLOCK_SIZE_KV
             kdt.load(K_global[KV_start:KV_end, :], K_tiles[stage, :, :])
             kdt.load(V_global[KV_start:KV_end, :], V_tiles[stage, :, :])
+        if kv_id == 0:
+            kdt.matmul(Q_tile, kdt.transpose(K_tiles[0], 0, 1), QK_tile, accumulate=False)
 
     for kv_id in range(0, num_kv_blocks):
         stage = kv_id % NUM_STAGES
         K_tile = K_tiles[stage]
         V_tile = V_tiles[stage]
-
-        kdt.matmul(Q_tile, kdt.transpose(K_tile, 0, 1), QK_tile, accumulate=False)
         
         prefetch_kv_id = kv_id + (NUM_STAGES - 1)
         prefetch_stage = prefetch_kv_id % NUM_STAGES
@@ -101,6 +101,14 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
         kdt.mul(O_tile, kdt.broadcast_to(kdt.unsqueeze(tmp1, 1), 1, D), O_tile)
         # PV_tile = matmul(..., ...) will overlap w/ VXM ops above
         
+        next_kv_id = kv_id + 1
+        if next_kv_id < num_kv_blocks:
+            next_stage = next_kv_id % NUM_STAGES
+            # type: MXM
+            kdt.matmul(Q_tile, kdt.transpose(K_tiles[next_stage], 0, 1), QK_tile, accumulate=False)
+            # Q @ K^T (MXM) of next stage overlap w/ below mul & add & div VXM operations
+
+        # type: VXM
         kdt.mul(PV_tile, kdt.broadcast_to(kdt.unsqueeze(local_rowmax_diff_exp, 1), 1, D), PV_tile)
         kdt.add(O_tile, PV_tile, O_tile)
         kdt.div(O_tile, kdt.broadcast_to(kdt.unsqueeze(global_exp_rowsum_new, 1), 1, D), O_tile)
