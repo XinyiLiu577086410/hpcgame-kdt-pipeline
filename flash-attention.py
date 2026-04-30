@@ -81,8 +81,13 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
         QK_tile_sub = QK_tile
         kdt.exp(QK_tile_sub, QK_tile_sub, e)
         QK_tile_sub_exp = QK_tile_sub
-        kdt.reduce(QK_tile_sub_exp, 1, 'sum', local_exp_rowsum)
         
+        kdt.matmul(QK_tile_sub_exp, V_tile, V_tile)
+        PV_tile = V_tile
+        
+        # PV_tile = matmul(..., ...) overlap w/ VXM ops under
+        kdt.reduce(QK_tile_sub_exp, 1, 'sum', local_exp_rowsum)
+
         kdt.max(local_rowmax, global_rowmax, global_rowmax_new)
 
         kdt.sub(global_rowmax, global_rowmax_new, global_rowmax_diff)
@@ -94,13 +99,15 @@ def flash_attention_kernel(task_args: Dict[str, int], io_tensors: Dict[str, kdt.
         kdt.mul(global_rowmax_diff_exp, global_exp_rowsum, tmp1)
         kdt.fma(local_rowmax_diff_exp, local_exp_rowsum, tmp1, global_exp_rowsum_new)
         kdt.mul(O_tile, kdt.broadcast_to(kdt.unsqueeze(tmp1, 1), 1, D), O_tile)
-        kdt.matmul(QK_tile_sub_exp, V_tile, V_tile)
-        PV_tile = V_tile
+        # PV_tile = matmul(..., ...) will overlap w/ VXM ops above
+        
         kdt.mul(PV_tile, kdt.broadcast_to(kdt.unsqueeze(local_rowmax_diff_exp, 1), 1, D), PV_tile)
         kdt.add(O_tile, PV_tile, O_tile)
         kdt.div(O_tile, kdt.broadcast_to(kdt.unsqueeze(global_exp_rowsum_new, 1), 1, D), O_tile)
         kdt.copy(global_rowmax_new, global_rowmax)
         kdt.copy(global_exp_rowsum_new, global_exp_rowsum)
+
+
     kdt.store(O_tile, O_global[Q_start:Q_end, :])
 
 
