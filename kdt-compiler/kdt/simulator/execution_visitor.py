@@ -56,10 +56,33 @@ class ExecutionVisitor(AutoRecursiveIRVisitor):
             HardwareQueue.VXM: 0,
             HardwareQueue.MXM: 0,
         }
+        # Optional profiler. When set, every instruction is recorded with its
+        # issue/finish cycle. See kdt.simulator.profiler.
+        self.tracer = None
+        self._current_instr = None
+
+    def set_tracer(self, tracer) -> None:
+        """Attach a TraceRecorder so instruction events are collected."""
+        self.tracer = tracer
 
     def get_cycle_usage(self) -> int:
         """Get total cycle usage of the executed job."""
         return self.last_instr_finish_cycle
+
+    @staticmethod
+    def _instr_label(instr) -> str:
+        """Human readable name for an IR instruction."""
+        if instr is None:
+            return "?"
+        if isinstance(instr, Binary):
+            return instr.op.value
+        if isinstance(instr, Unary):
+            return instr.op.value
+        if isinstance(instr, Compare):
+            return instr.op.value
+        if isinstance(instr, Reduce):
+            return f"reduce_{instr.op}"
+        return type(instr).__name__
     
     # ----------------------------------------------------------------------
     # Expression evaluation
@@ -190,13 +213,15 @@ class ExecutionVisitor(AutoRecursiveIRVisitor):
         `instr_latency_calculator` should be a callable that takes a list of all data chunks and returns the instruction execution time in cycles.
         """
         resolved_chunks = []    # (data_chunk, write_release_time_chunk, read_release_time_chunk) of every request
-        issue_cycle_constraints = [
-            self.context.get_nxt_isu_issue_cycle()
-        ]
+        constraints: Dict[str, int] = {
+            "isu": self.context.get_nxt_isu_issue_cycle(),
+        }
 
         if hardware_queue is not None:
-            issue_cycle_constraints.append(self.last_instr_finish_cycle_in_hardware_queues[hardware_queue])
+            constraints["queue"] = self.last_instr_finish_cycle_in_hardware_queues[hardware_queue]
 
+        dep_write = 0
+        dep_read = 0
         for request in requests:
             tile = request.tile
             memory_space = request.memory_space
@@ -230,12 +255,14 @@ class ExecutionVisitor(AutoRecursiveIRVisitor):
             resolved_chunks.append((data_chunk, write_release_time_chunk, read_release_time_chunk))
 
             # Get issue cycle
-            issue_cycle_constraints.append(np.max(write_release_time_chunk, initial=0))   # 不论是读取还是写入，都需要等待上一次写入完成，防止 WAR 和 WAW 冲突
+            dep_write = max(dep_write, int(np.max(write_release_time_chunk, initial=0)))   # 不论是读取还是写入，都需要等待上一次写入完成，防止 WAR 和 WAW 冲突
             if request.is_output:
                 # 需要等待上一次读取完成，防止 RAW 冲突
-                issue_cycle_constraints.append(np.max(read_release_time_chunk, initial=0))
-            
-        issue_cycle = int(max(issue_cycle_constraints))
+                dep_read = max(dep_read, int(np.max(read_release_time_chunk, initial=0)))
+
+        constraints["dep_write"] = dep_write
+        constraints["dep_read"] = dep_read
+        issue_cycle = int(max(constraints.values()))
         data_chunks = [x for (x, _, _) in resolved_chunks]
 
         # Update release times
@@ -261,6 +288,35 @@ class ExecutionVisitor(AutoRecursiveIRVisitor):
             self.last_instr_finish_cycle_in_hardware_queues[hardware_queue] = max(
                 self.last_instr_finish_cycle_in_hardware_queues[hardware_queue],
                 finish_cycle
+            )
+
+        # Profiling hook
+        if self.tracer is not None:
+            if hardware_queue is not None:
+                unit = hardware_queue.value
+            elif isinstance(self._current_instr, (Load, Store)):
+                unit = "MEM"
+            else:
+                unit = "CTRL"
+            args = {
+                "issue": issue_cycle,
+                "finish": finish_cycle,
+                "exec": instr_exec_time,
+                "isu": constraints["isu"],
+                "queue": constraints.get("queue"),
+                "dep_write": dep_write,
+                "dep_read": dep_read,
+            }
+            if data_chunks:
+                args["shape"] = [int(s) for s in data_chunks[0].shape]
+            self.tracer.record(
+                job_id=self.context.job_id,
+                unit=unit,
+                start=issue_cycle,
+                end=finish_cycle,
+                name=self._instr_label(self._current_instr),
+                args=args,
+                update_isu=update_isu_issue_cycle,
             )
 
         return (data_chunks, issue_cycle)
@@ -550,7 +606,9 @@ class ExecutionVisitor(AutoRecursiveIRVisitor):
         for instr in node.instructions:
             if time.time() > self.end_time_limit:
                 raise TimeoutError(f"Simulation exceeded time limit.")
+            self._current_instr = instr
             instr.accept(self)
+        self._current_instr = None
 
     def visit_ForLoop(self, node: ForLoop):
         start = node.start.accept(self)

@@ -5,6 +5,7 @@ import dataclasses
 import sys
 import os
 
+import lib
 from task1 import test_task1
 from task2 import test_task2
 from task3 import test_task3
@@ -58,6 +59,11 @@ def main(args: argparse.Namespace):
         score_of_task = 0.0
 
         for testcase_idx in range(task_spec.num_testcases):
+            if args.profile_path is not None:
+                os.makedirs(args.profile_path, exist_ok=True)
+                lib.PROFILE_PATH = os.path.join(
+                    args.profile_path, f"task{task_idx}_case{testcase_idx}.json"
+                )
             score = task_spec.tester(testcase_idx, players_kernel, args.print_ir)
             score_of_task += score * (1.0 / task_spec.num_testcases)
         cur_task_score = score_of_task / 100.0 * task_spec.score
@@ -70,7 +76,14 @@ if __name__ == '__main__':
     parser.add_argument('--task', type=int, help="Task ID to test (e.g., 1 for Task 1)")
     parser.add_argument('--kernel-impl-path', type=str, required=True, help="Path to the player's kernel implementation")
     parser.add_argument('--print-ir', action='store_true')
+    parser.add_argument('--profile-path', type=str, default=None,
+                        help="Directory to write Perfetto/Chrome-trace JSON profiles into.")
+    parser.add_argument('--profile-jobs', type=str, default=None,
+                        help="Comma separated job ids to profile (default: all jobs).")
     parsed_args = parser.parse_args()
+
+    if parsed_args.profile_jobs:
+        lib.PROFILE_JOBS = [int(x) for x in parsed_args.profile_jobs.replace(" ", "").split(",") if x != ""]
 
     main(parsed_args)
 

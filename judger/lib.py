@@ -6,6 +6,11 @@ import torch
 
 import kdt
 
+# Optional profiling configuration. When PROFILE_PATH is set, the kernel is
+# launched with a Perfetto/Chrome-trace profile written to that path.
+PROFILE_PATH = None
+PROFILE_JOBS = None
+
 def set_random_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -25,7 +30,13 @@ class PlayersKernelHandler:
             if self.print_ir:
                 self.compiled_kernel.print_ir()
         try:
-            num_cycles = kdt.launch_kernel(self.compiled_kernel, io_tensors, self.tpu_spec)
+            if PROFILE_PATH is not None:
+                num_cycles = kdt.launch_kernel(
+                    self.compiled_kernel, io_tensors, self.tpu_spec,
+                    profile_path=PROFILE_PATH, profile_jobs=PROFILE_JOBS,
+                )
+            else:
+                num_cycles = kdt.launch_kernel(self.compiled_kernel, io_tensors, self.tpu_spec)
         except TimeoutError:
             num_cycles = float('inf')  # Indicate timeout with infinite cycles
         return num_cycles
